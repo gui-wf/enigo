@@ -75,7 +75,7 @@ impl Con {
             Self::unused_keycodes(min_keycode, max_keycode, keysyms_per_keycode, &keysyms); // Check if a mapping is possible
 
         if unused_keycodes.is_empty() {
-            return Err(NewConError::NoEmptyKeycodes);
+            warn!("no empty keycodes available; dynamic remapping for exotic characters will fail, but standard characters found via level search will still work");
         }
         let keymap = KeyMap::new(
             min_keycode,
