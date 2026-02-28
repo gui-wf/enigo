@@ -18,6 +18,7 @@ pub(super) struct KeyMapMapping<Keycode> {
     keysyms_per_keycode: u8,
     keysyms: Vec<u32>,
     unused_keycodes: VecDeque<Keycode>,
+    num_groups: u8,
 }
 
 #[derive(Debug)]
@@ -55,6 +56,7 @@ where
         unused_keycodes: VecDeque<Keycode>,
         keysyms_per_keycode: u8,
         keysyms: Vec<u32>,
+        num_groups: u8,
     ) -> Self {
         let capacity: usize = keycode_max.try_into().unwrap() - keycode_min.try_into().unwrap();
         let capacity = capacity + 1;
@@ -74,6 +76,7 @@ where
             keysyms_per_keycode,
             keysyms,
             unused_keycodes,
+            num_groups,
         };
 
         #[cfg(feature = "x11rb")]
@@ -132,14 +135,92 @@ where
         None
     }
 
+    /// Search for a keysym only within columns belonging to the given XKB group.
+    ///
+    /// The `GetKeyboardMapping` flat array interleaves groups:
+    /// `[G1L0, G1L1, G2L0, G2L1, G1L2, G1L3, G2L2, G2L3, ...]`
+    /// Each pair of adjacent columns cycles through groups. For column `j`:
+    /// `group_of_col = (j / 2) % num_groups`
+    ///
+    /// Uses raw array indexing instead of `xkeysym::keysym()` to avoid its
+    /// column-folding logic that can mask the group distinction (e.g. folding
+    /// column 2 back to column 0 when trailing keysyms are NoSymbol).
+    ///
+    /// Returns `(keycode, column)` where column is the raw index into the
+    /// per-keycode keysym array.
+    fn keysym_to_keycode_in_group(
+        &self,
+        keysym: Keysym,
+        active_group: u8,
+    ) -> Option<(Keycode, u8)> {
+        let keycode_min: usize = self.keymap_mapping.keycode_min.try_into().unwrap();
+        let keycode_max: usize = self.keymap_mapping.keycode_max.try_into().unwrap();
+        let num_groups = self.keymap_mapping.num_groups.max(1) as usize;
+        let kpc = self.keymap_mapping.keysyms_per_keycode as usize;
+
+        for i in keycode_min..=keycode_max {
+            let offset = (i - keycode_min) * kpc;
+            for j in 0..kpc {
+                // Determine which group this column belongs to.
+                // Columns are paired: [G1L0, G1L1, G2L0, G2L1, G1L2, G1L3, ...]
+                let group_of_col = (j / 2) % num_groups;
+                if group_of_col != active_group as usize {
+                    continue;
+                }
+
+                let raw_keysym = self.keymap_mapping.keysyms[offset + j];
+                if raw_keysym == Keysym::NoSymbol.raw() {
+                    continue;
+                }
+                if Keysym::from(raw_keysym) == keysym {
+                    let keycode: Keycode = i.try_into().unwrap();
+                    trace!(
+                        "found keysym in group {active_group} at row {keycode}, col {j}"
+                    );
+                    return Some((keycode, j as u8));
+                }
+            }
+        }
+        None
+    }
+
+    /// Convert a raw column index to the intra-group level for modifier lookup.
+    ///
+    /// Columns are interleaved: `[G1L0, G1L1, G2L0, G2L1, G1L2, G1L3, ...]`
+    /// Each pair of columns cycles through groups. Within a group, the level is
+    /// determined by which pair this column is in and whether it's even/odd:
+    /// `level = (pair_index * 2) + (column % 2)`
+    /// where `pair_index = column / (2 * num_groups)`
+    pub fn column_to_level(column: u8, num_groups: u8) -> u8 {
+        let ng = num_groups.max(1) as u16;
+        let col = column as u16;
+        let pair = col / (2 * ng);
+        (pair * 2 + col % 2) as u8
+    }
+
     // Try to enter the key
     #[allow(clippy::unnecessary_wraps)]
     pub fn key_to_keycode<C: Bind<Keycode>>(
         &mut self,
         c: &C,
         key: Key,
+        active_group: Option<u8>,
     ) -> InputResult<(Keycode, u8)> {
         let sym = Keysym::from(key);
+        let num_groups = self.keymap_mapping.num_groups;
+
+        // Try group-aware search first when multiple groups are active
+        if let Some(group) = active_group {
+            if num_groups > 1 {
+                if let Some((keycode, column)) =
+                    self.keysym_to_keycode_in_group(sym, group)
+                {
+                    let level = Self::column_to_level(column, num_groups);
+                    return Ok((keycode, level));
+                }
+                // Fall through to ungrouped search for keysyms shared across groups
+            }
+        }
 
         if let Some((keycode, level)) = self.keysym_to_keycode(sym) {
             return Ok((keycode, level));

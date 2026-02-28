@@ -7,6 +7,7 @@ use x11rb::{
     protocol::{
         randr::ConnectionExt as _,
         xinput::DeviceUse,
+        xkb::ConnectionExt as _,
         xproto::{ConnectionExt as _, GetKeyboardMappingReply, GetModifierMappingReply, Screen},
         xtest::ConnectionExt as _,
     },
@@ -29,6 +30,7 @@ pub struct Con {
     keymap: KeyMap<Keycode>,
     modifiers: [Vec<Keycode>; 8],
     delay: u32, // milliseconds
+    num_groups: u8,
 }
 
 impl From<ConnectionError> for NewConError {
@@ -77,12 +79,14 @@ impl Con {
         if unused_keycodes.is_empty() {
             warn!("no empty keycodes available; dynamic remapping for exotic characters will fail, but standard characters found via level search will still work");
         }
+        let num_groups = Self::init_xkb(&connection);
         let keymap = KeyMap::new(
             min_keycode,
             max_keycode,
             unused_keycodes,
             keysyms_per_keycode,
             keysyms,
+            num_groups,
         );
 
         // Get the keycodes of the modifiers
@@ -94,6 +98,7 @@ impl Con {
             keymap,
             modifiers,
             delay,
+            num_groups,
         })
     }
 
@@ -188,6 +193,85 @@ impl Con {
         debug!("the keycodes associated with the modifiers are:\n{modifiers_array:?}");
 
         Ok(modifiers_array)
+    }
+
+    /// Initialize the XKB extension and return the number of keyboard groups.
+    ///
+    /// If XKB initialization fails (e.g. very old X server), returns 1 which
+    /// preserves single-group behavior with no regression.
+    fn init_xkb(connection: &CompositorConnection) -> u8 {
+        // Negotiate XKB extension version (1.0 is sufficient for our needs)
+        let xkb_result = connection.xkb_use_extension(1, 0);
+        match xkb_result {
+            Ok(cookie) => match cookie.reply() {
+                Ok(reply) => {
+                    if !reply.supported {
+                        debug!("XKB extension not supported by server, assuming 1 group");
+                        return 1;
+                    }
+                }
+                Err(e) => {
+                    debug!("XKB use_extension reply failed: {e:?}, assuming 1 group");
+                    return 1;
+                }
+            },
+            Err(e) => {
+                debug!("XKB use_extension request failed: {e:?}, assuming 1 group");
+                return 1;
+            }
+        }
+
+        // Query the number of groups from keyboard controls
+        let controls_result = connection.xkb_get_controls(
+            x11rb::protocol::xkb::ID::USE_CORE_KBD.into(),
+        );
+        match controls_result {
+            Ok(cookie) => match cookie.reply() {
+                Ok(reply) => {
+                    let num_groups = reply.num_groups;
+                    debug!("XKB reports {num_groups} keyboard group(s)");
+                    if num_groups == 0 { 1 } else { num_groups }
+                }
+                Err(e) => {
+                    debug!("XKB get_controls reply failed: {e:?}, assuming 1 group");
+                    1
+                }
+            },
+            Err(e) => {
+                debug!("XKB get_controls request failed: {e:?}, assuming 1 group");
+                1
+            }
+        }
+    }
+
+    /// Query the currently active XKB group (keyboard layout).
+    ///
+    /// Returns 0 if the query fails, preserving first-group behavior.
+    fn active_group(&self) -> u8 {
+        if self.num_groups <= 1 {
+            return 0;
+        }
+
+        let state_result = self.connection.xkb_get_state(
+            x11rb::protocol::xkb::ID::USE_CORE_KBD.into(),
+        );
+        match state_result {
+            Ok(cookie) => match cookie.reply() {
+                Ok(reply) => {
+                    let group: u8 = reply.group.into();
+                    trace!("XKB active group: {group}");
+                    group
+                }
+                Err(e) => {
+                    debug!("XKB get_state reply failed: {e:?}, assuming group 0");
+                    0
+                }
+            },
+            Err(e) => {
+                debug!("XKB get_state request failed: {e:?}, assuming group 0");
+                0
+            }
+        }
     }
 
     // Get the device id of the first device that is found which has the same usage
@@ -304,7 +388,10 @@ impl Keyboard for Con {
     }
 
     fn key(&mut self, key: Key, direction: Direction) -> InputResult<()> {
-        let (keycode, level) = self.keymap.key_to_keycode(&self.connection, key)?;
+        let active_group = self.active_group();
+        let (keycode, level) =
+            self.keymap
+                .key_to_keycode(&self.connection, key, Some(active_group))?;
 
         if log::log_enabled!(log::Level::Debug) {
             for (mod_idx, mod_keycodes) in self.modifiers.iter().enumerate() {
