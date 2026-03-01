@@ -15,6 +15,11 @@
 - all: Removed the field `linux_delay` from `Settings` struct as it no longer serves a purpose
 
 ## Fixed
+- linux: x11rb: search all keymap levels in keysym_to_keycode, fixing uppercase letters and shifted symbols
+- linux: x11rb: prefer standard keycodes over XWayland extended keycodes for correct input translation
+- linux: x11rb: add AltGr/Mode_switch modifier support for keysym levels 2-5
+- linux: x11rb: add XKB group awareness for multi-layout keyboards
+- linux: x11rb: allow init when no empty keycodes are available (common on XWayland)
 - linux: Added `NumpadEnter` key
 - win: Added `NumpadEnter` key
 - win: Extended keys can now be correctly simulated with the raw() function.

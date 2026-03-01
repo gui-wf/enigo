@@ -7,6 +7,9 @@ pub(super) use xkeysym::{KeyCode, Keysym};
 
 use crate::{Direction, InputError, InputResult, Key};
 
+#[cfg(feature = "x11rb")]
+const DEFAULT_DELAY: u32 = 12;
+
 #[derive(Debug)]
 pub(super) struct KeyMapMapping<Keycode> {
     pub(super) additionally_mapped: HashMap<Keysym, Keycode>,
@@ -15,18 +18,28 @@ pub(super) struct KeyMapMapping<Keycode> {
     keysyms_per_keycode: u8,
     keysyms: Vec<u32>,
     unused_keycodes: VecDeque<Keycode>,
+    num_groups: u8,
 }
 
 #[derive(Debug)]
 struct KeyMapState<Keycode> {
     held_keycodes: Vec<Keycode>, // cannot get unmapped
     needs_regeneration: bool,
+    #[cfg(feature = "x11rb")]
+    last_keys: Vec<Keycode>, // last pressed keycodes
 }
 
 #[derive(Debug)]
 pub struct KeyMap<Keycode> {
     pub(super) keymap_mapping: KeyMapMapping<Keycode>,
     keymap_state: KeyMapState<Keycode>,
+
+    #[cfg(feature = "x11rb")]
+    delay: u32, // milliseconds
+    #[cfg(feature = "x11rb")]
+    last_event_before_delays: std::time::Instant, // time of the last event
+    #[cfg(feature = "x11rb")]
+    pending_delays: u32,
 }
 
 impl<Keycode> KeyMap<Keycode>
@@ -43,6 +56,7 @@ where
         unused_keycodes: VecDeque<Keycode>,
         keysyms_per_keycode: u8,
         keysyms: Vec<u32>,
+        num_groups: u8,
     ) -> Self {
         let capacity: usize = keycode_max.try_into().unwrap() - keycode_min.try_into().unwrap();
         let capacity = capacity + 1;
@@ -51,6 +65,8 @@ where
         let keymap_state = KeyMapState {
             held_keycodes: vec![],
             needs_regeneration: true,
+            #[cfg(feature = "x11rb")]
+            last_keys: vec![],
         };
 
         let keymap_mapping = KeyMapMapping {
@@ -60,22 +76,42 @@ where
             keysyms_per_keycode,
             keysyms,
             unused_keycodes,
+            num_groups,
         };
+
+        #[cfg(feature = "x11rb")]
+        let delay = DEFAULT_DELAY;
+        #[cfg(feature = "x11rb")]
+        let last_event_before_delays = std::time::Instant::now();
+        #[cfg(feature = "x11rb")]
+        let pending_delays = 0;
 
         Self {
             keymap_mapping,
             keymap_state,
+            #[cfg(feature = "x11rb")]
+            delay,
+            #[cfg(feature = "x11rb")]
+            last_event_before_delays,
+            #[cfg(feature = "x11rb")]
+            pending_delays,
         }
     }
 
-    fn keysym_to_keycode(&self, keysym: Keysym) -> Option<Keycode> {
+    fn keysym_to_keycode(&self, keysym: Keysym) -> Option<(Keycode, u8)> {
         let keycode_min: usize = self.keymap_mapping.keycode_min.try_into().unwrap();
         let keycode_max: usize = self.keymap_mapping.keycode_max.try_into().unwrap();
 
-        // TODO: Change this range to 0..self.keysyms_per_keycode once we find out how
-        // to detect the level and switch it
-        for j in 0..1 {
-            for i in keycode_min..=keycode_max {
+        // Iterate keycodes in the outer loop, levels in the inner loop.
+        // This ensures we find keysyms at the lowest keycode first (standard
+        // keyboard range), even at a higher level (e.g. Shift), rather than
+        // finding them at XWayland's extended high keycodes at level 0.
+        // On XWayland, uppercase keysyms like 'H' exist both at high keycodes
+        // (e.g. 219) at level 0 and at the standard 'h' keycode (43) at level 1.
+        // The standard keycode + Shift translates correctly through XWayland,
+        // while the high keycodes do not.
+        for i in keycode_min..=keycode_max {
+            for j in 0..self.keymap_mapping.keysyms_per_keycode {
                 let i: u32 = i.try_into().unwrap();
                 let min_keycode: u32 = keycode_min.try_into().unwrap();
                 let keycode = KeyCode::from(i);
@@ -91,7 +127,7 @@ where
                         let i: usize = i.try_into().unwrap();
                         let i: Keycode = i.try_into().unwrap();
                         trace!("found keysym in row {i}, col {j}");
-                        return Some(i);
+                        return Some((i, j));
                     }
                 }
             }
@@ -99,13 +135,95 @@ where
         None
     }
 
+    /// Search for a keysym only within columns belonging to the given XKB group.
+    ///
+    /// The `GetKeyboardMapping` flat array interleaves groups:
+    /// `[G1L0, G1L1, G2L0, G2L1, G1L2, G1L3, G2L2, G2L3, ...]`
+    /// Each pair of adjacent columns cycles through groups. For column `j`:
+    /// `group_of_col = (j / 2) % num_groups`
+    ///
+    /// Uses raw array indexing instead of `xkeysym::keysym()` to avoid its
+    /// column-folding logic that can mask the group distinction (e.g. folding
+    /// column 2 back to column 0 when trailing keysyms are NoSymbol).
+    ///
+    /// Returns `(keycode, column)` where column is the raw index into the
+    /// per-keycode keysym array.
+    fn keysym_to_keycode_in_group(
+        &self,
+        keysym: Keysym,
+        active_group: u8,
+    ) -> Option<(Keycode, u8)> {
+        let keycode_min: usize = self.keymap_mapping.keycode_min.try_into().unwrap();
+        let keycode_max: usize = self.keymap_mapping.keycode_max.try_into().unwrap();
+        let num_groups = self.keymap_mapping.num_groups.max(1) as usize;
+        let kpc = self.keymap_mapping.keysyms_per_keycode as usize;
+
+        for i in keycode_min..=keycode_max {
+            let offset = (i - keycode_min) * kpc;
+            for j in 0..kpc {
+                // Determine which group this column belongs to.
+                // Columns are paired: [G1L0, G1L1, G2L0, G2L1, G1L2, G1L3, ...]
+                let group_of_col = (j / 2) % num_groups;
+                if group_of_col != active_group as usize {
+                    continue;
+                }
+
+                let raw_keysym = self.keymap_mapping.keysyms[offset + j];
+                if raw_keysym == Keysym::NoSymbol.raw() {
+                    continue;
+                }
+                if Keysym::from(raw_keysym) == keysym {
+                    let keycode: Keycode = i.try_into().unwrap();
+                    trace!(
+                        "found keysym in group {active_group} at row {keycode}, col {j}"
+                    );
+                    return Some((keycode, j as u8));
+                }
+            }
+        }
+        None
+    }
+
+    /// Convert a raw column index to the intra-group level for modifier lookup.
+    ///
+    /// Columns are interleaved: `[G1L0, G1L1, G2L0, G2L1, G1L2, G1L3, ...]`
+    /// Each pair of columns cycles through groups. Within a group, the level is
+    /// determined by which pair this column is in and whether it's even/odd:
+    /// `level = (pair_index * 2) + (column % 2)`
+    /// where `pair_index = column / (2 * num_groups)`
+    pub fn column_to_level(column: u8, num_groups: u8) -> u8 {
+        let ng = num_groups.max(1) as u16;
+        let col = column as u16;
+        let pair = col / (2 * ng);
+        (pair * 2 + col % 2) as u8
+    }
+
     // Try to enter the key
     #[allow(clippy::unnecessary_wraps)]
-    pub fn key_to_keycode<C: Bind<Keycode>>(&mut self, c: &C, key: Key) -> InputResult<Keycode> {
+    pub fn key_to_keycode<C: Bind<Keycode>>(
+        &mut self,
+        c: &C,
+        key: Key,
+        active_group: Option<u8>,
+    ) -> InputResult<(Keycode, u8)> {
         let sym = Keysym::from(key);
+        let num_groups = self.keymap_mapping.num_groups;
 
-        if let Some(keycode) = self.keysym_to_keycode(sym) {
-            return Ok(keycode);
+        // Try group-aware search first when multiple groups are active
+        if let Some(group) = active_group {
+            if num_groups > 1 {
+                if let Some((keycode, column)) =
+                    self.keysym_to_keycode_in_group(sym, group)
+                {
+                    let level = Self::column_to_level(column, num_groups);
+                    return Ok((keycode, level));
+                }
+                // Fall through to ungrouped search for keysyms shared across groups
+            }
+        }
+
+        if let Some((keycode, level)) = self.keysym_to_keycode(sym) {
+            return Ok((keycode, level));
         }
 
         let keycode = {
@@ -121,7 +239,21 @@ where
             }
         };
 
-        Ok(keycode)
+        #[cfg(feature = "x11rb")]
+        self.update_delays(keycode);
+        // bind_key maps to both levels, so level 0 is fine
+        Ok((keycode, 0))
+    }
+
+    /// Check if a keycode is currently held
+    pub fn is_keycode_held(&self, keycode: &Keycode) -> bool {
+        self.keymap_state.held_keycodes.contains(keycode)
+    }
+
+    /// Get the pending delay
+    #[cfg(feature = "x11rb")]
+    pub fn pending_delays(&self) -> u32 {
+        self.pending_delays
     }
 
     /// Add the Keysym to the keymap
@@ -167,6 +299,30 @@ where
         Ok(())
     }
 
+    // Update the delay
+    #[cfg(feature = "x11rb")]
+    pub fn update_delays(&mut self, keycode: Keycode) {
+        // Check if a delay is needed
+        // A delay is required, if one of the keycodes was recently entered and there
+        // was no delay between it
+
+        if self.keymap_state.last_keys.contains(&keycode) {
+            let elapsed_ms = self
+                .last_event_before_delays
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u32::MAX);
+            self.pending_delays = self.delay.saturating_sub(elapsed_ms);
+            trace!("delay needed");
+            self.keymap_state.last_keys.clear();
+        } else {
+            trace!("no delay needed");
+            self.pending_delays = 1;
+        }
+        self.keymap_state.last_keys.push(keycode);
+    }
+
     /// Check if there are still unused keycodes available. If there aren't,
     /// make some room by freeing the already mapped keycodes.
     /// Returns true, if keys were unmapped and the keymap needs to be
@@ -204,6 +360,11 @@ where
                 self.keymap_state.held_keycodes.retain(|&k| k != keycode);
             }
             Direction::Click => (),
+        }
+
+        #[cfg(feature = "x11rb")]
+        {
+            self.last_event_before_delays = std::time::Instant::now();
         }
     }
 }

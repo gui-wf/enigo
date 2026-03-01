@@ -7,6 +7,7 @@ use x11rb::{
     protocol::{
         randr::ConnectionExt as _,
         xinput::DeviceUse,
+        xkb::ConnectionExt as _,
         xproto::{ConnectionExt as _, GetKeyboardMappingReply, GetModifierMappingReply, Screen},
         xtest::ConnectionExt as _,
     },
@@ -28,6 +29,7 @@ pub struct Con {
     screen: Screen,
     keymap: KeyMap<Keycode>,
     modifiers: [Vec<Keycode>; 8],
+    num_groups: u8,
 }
 
 impl From<ConnectionError> for NewConError {
@@ -72,14 +74,16 @@ impl Con {
             Self::unused_keycodes(min_keycode, max_keycode, keysyms_per_keycode, &keysyms); // Check if a mapping is possible
 
         if unused_keycodes.is_empty() {
-            return Err(NewConError::NoEmptyKeycodes);
+            warn!("no empty keycodes available; dynamic remapping for exotic characters will fail, but standard characters found via level search will still work");
         }
+        let num_groups = Self::init_xkb(&connection);
         let keymap = KeyMap::new(
             min_keycode,
             max_keycode,
             unused_keycodes,
             keysyms_per_keycode,
             keysyms,
+            num_groups,
         );
 
         // Get the keycodes of the modifiers
@@ -90,6 +94,7 @@ impl Con {
             screen,
             keymap,
             modifiers,
+            num_groups,
         })
     }
 
@@ -175,6 +180,85 @@ impl Con {
         Ok(modifiers_array)
     }
 
+    /// Initialize the XKB extension and return the number of keyboard groups.
+    ///
+    /// If XKB initialization fails (e.g. very old X server), returns 1 which
+    /// preserves single-group behavior with no regression.
+    fn init_xkb(connection: &CompositorConnection) -> u8 {
+        // Negotiate XKB extension version (1.0 is sufficient for our needs)
+        let xkb_result = connection.xkb_use_extension(1, 0);
+        match xkb_result {
+            Ok(cookie) => match cookie.reply() {
+                Ok(reply) => {
+                    if !reply.supported {
+                        debug!("XKB extension not supported by server, assuming 1 group");
+                        return 1;
+                    }
+                }
+                Err(e) => {
+                    debug!("XKB use_extension reply failed: {e:?}, assuming 1 group");
+                    return 1;
+                }
+            },
+            Err(e) => {
+                debug!("XKB use_extension request failed: {e:?}, assuming 1 group");
+                return 1;
+            }
+        }
+
+        // Query the number of groups from keyboard controls
+        let controls_result = connection.xkb_get_controls(
+            x11rb::protocol::xkb::ID::USE_CORE_KBD.into(),
+        );
+        match controls_result {
+            Ok(cookie) => match cookie.reply() {
+                Ok(reply) => {
+                    let num_groups = reply.num_groups;
+                    debug!("XKB reports {num_groups} keyboard group(s)");
+                    if num_groups == 0 { 1 } else { num_groups }
+                }
+                Err(e) => {
+                    debug!("XKB get_controls reply failed: {e:?}, assuming 1 group");
+                    1
+                }
+            },
+            Err(e) => {
+                debug!("XKB get_controls request failed: {e:?}, assuming 1 group");
+                1
+            }
+        }
+    }
+
+    /// Query the currently active XKB group (keyboard layout).
+    ///
+    /// Returns 0 if the query fails, preserving first-group behavior.
+    fn active_group(&self) -> u8 {
+        if self.num_groups <= 1 {
+            return 0;
+        }
+
+        let state_result = self.connection.xkb_get_state(
+            x11rb::protocol::xkb::ID::USE_CORE_KBD.into(),
+        );
+        match state_result {
+            Ok(cookie) => match cookie.reply() {
+                Ok(reply) => {
+                    let group: u8 = reply.group.into();
+                    trace!("XKB active group: {group}");
+                    group
+                }
+                Err(e) => {
+                    debug!("XKB get_state reply failed: {e:?}, assuming group 0");
+                    0
+                }
+            },
+            Err(e) => {
+                debug!("XKB get_state request failed: {e:?}, assuming group 0");
+                0
+            }
+        }
+    }
+
     // Get the device id of the first device that is found which has the same usage
     // as the input parameter
     fn device_id(&self, usage: DeviceUse) -> InputResult<u8> {
@@ -229,13 +313,68 @@ impl Bind<Keycode> for CompositorConnection {
     }
 }
 
+impl Con {
+    /// Return the modifier keycodes needed for a given keysym level.
+    ///
+    /// X11 keymap columns map to groups and levels:
+    /// - Column 0: Group 1, no modifier
+    /// - Column 1: Group 1, Shift
+    /// - Column 2: Group 1, Level3 (AltGr/Mode_switch) or Group 2
+    /// - Column 3: Group 1, Level3 + Shift or Group 2 + Shift
+    /// - Column 4+: higher levels, typically ISO_Level3_Shift-based
+    ///
+    /// On most Linux systems, AltGr is at Mod5 (modifier index 7).
+    fn modifier_keycodes_for_level(&self, level: u8) -> Vec<u8> {
+        match level {
+            0 => vec![],
+            1 => self.modifiers[0].first().copied().into_iter().collect(), // Shift
+            2 | 4 => {
+                // AltGr / ISO_Level3_Shift / Mode_switch - typically Mod5 (index 7)
+                // Fall back to Mod3 (index 5) if Mod5 is empty
+                if let Some(&kc) = self.modifiers[7].first() {
+                    vec![kc]
+                } else if let Some(&kc) = self.modifiers[5].first() {
+                    vec![kc]
+                } else {
+                    warn!("no AltGr modifier found for keysym level {level}");
+                    vec![]
+                }
+            }
+            3 | 5 => {
+                // AltGr + Shift
+                let mut mods = vec![];
+                if let Some(&kc) = self.modifiers[7].first() {
+                    mods.push(kc);
+                } else if let Some(&kc) = self.modifiers[5].first() {
+                    mods.push(kc);
+                }
+                if let Some(&kc) = self.modifiers[0].first() {
+                    mods.push(kc);
+                }
+                if mods.is_empty() {
+                    warn!("no modifiers found for keysym level {level}");
+                }
+                mods
+            }
+            _ => {
+                warn!("modifier for keysym level {level} not yet supported");
+                vec![]
+            }
+        }
+    }
+}
+
 impl Keyboard for Con {
     fn fast_text(&mut self, _text: &str) -> InputResult<Option<()>> {
+        warn!("fast text entry is not possible on X11");
         Ok(None)
     }
 
     fn key(&mut self, key: Key, direction: Direction) -> InputResult<()> {
-        let keycode = self.keymap.key_to_keycode(&self.connection, key)?;
+        let active_group = self.active_group();
+        let (keycode, level) =
+            self.keymap
+                .key_to_keycode(&self.connection, key, Some(active_group))?;
 
         if log::log_enabled!(log::Level::Debug) {
             for (mod_idx, mod_keycodes) in self.modifiers.iter().enumerate() {
@@ -245,7 +384,43 @@ impl Keyboard for Con {
             }
         }
 
-        self.raw(keycode.into(), direction)
+        let mod_keycodes = self.modifier_keycodes_for_level(level);
+
+        if mod_keycodes.is_empty() {
+            self.raw(keycode.into(), direction)
+        } else {
+            // Track which modifiers we actually need to press (skip already-held ones)
+            let mods_to_press: Vec<u8> = mod_keycodes
+                .iter()
+                .copied()
+                .filter(|kc| !self.keymap.is_keycode_held(kc))
+                .collect();
+
+            match direction {
+                Direction::Click => {
+                    for &mod_kc in &mods_to_press {
+                        self.raw(mod_kc.into(), Direction::Press)?;
+                    }
+                    self.raw(keycode.into(), Direction::Click)?;
+                    for &mod_kc in mods_to_press.iter().rev() {
+                        self.raw(mod_kc.into(), Direction::Release)?;
+                    }
+                }
+                Direction::Press => {
+                    for &mod_kc in &mods_to_press {
+                        self.raw(mod_kc.into(), Direction::Press)?;
+                    }
+                    self.raw(keycode.into(), Direction::Press)?;
+                }
+                Direction::Release => {
+                    self.raw(keycode.into(), Direction::Release)?;
+                    for &mod_kc in mods_to_press.iter().rev() {
+                        self.raw(mod_kc.into(), Direction::Release)?;
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 
     fn raw(&mut self, keycode: u16, direction: Direction) -> InputResult<()> {
@@ -254,13 +429,13 @@ impl Keyboard for Con {
                 "Keycode was too large. It has to fit in u8 on X11",
             ));
         };
-        let time = x11rb::CURRENT_TIME; // CURRENT_TIME == 0
+        let time = self.keymap.pending_delays();
         let root = self.screen.root;
         let root_x = 0;
         let root_y = 0;
         let deviceid = self.device_id(DeviceUse::IS_X_KEYBOARD)?;
 
-        debug!("xtest_fake_input with keycode {keycode}, deviceid {deviceid}, time {time}");
+        debug!("xtest_fake_input with keycode {keycode}, deviceid {deviceid}, delay {time}");
         if direction == Direction::Press || direction == Direction::Click {
             self.connection
                 .xtest_fake_input(
@@ -277,11 +452,6 @@ impl Keyboard for Con {
                     InputError::Simulate("error when using xtest_fake_input with x11rb")
                 })?;
             trace!("press");
-
-            self.connection.sync() .map_err(|e| {
-                error!("{e}");
-                InputError::Simulate("error when syncing with X server using x11rb after xtest_fake_input was called")
-            })?;
         }
 
         if direction == Direction::Release || direction == Direction::Click {
@@ -300,12 +470,13 @@ impl Keyboard for Con {
                     InputError::Simulate("error when using xtest_fake_input with x11rb")
                 })?;
             trace!("released");
+        }
 
-            self.connection.sync() .map_err(|e| {
+        self.connection.sync()
+            .map_err(|e| {
                 error!("{e}");
                 InputError::Simulate("error when syncing with X server using x11rb after xtest_fake_input was called")
             })?;
-        }
 
         // Let the keymap know that the key was held/no longer held
         // This is important to avoid unmapping held keys
@@ -350,12 +521,6 @@ impl Mouse for Con {
                     error!("{e}");
                     InputError::Simulate("error when using xtest_fake_input with x11rb")
                 })?;
-
-            self.connection.sync()
-            .map_err(|e| {
-                error!("{e}");
-                InputError::Simulate("error when syncing with X server using x11rb after xtest_fake_input was called")
-            })?;
         }
         if direction == Direction::Release || direction == Direction::Click {
             self.connection
@@ -372,13 +537,12 @@ impl Mouse for Con {
                     error!("{e}");
                     InputError::Simulate("error when using xtest_fake_input with x11rb")
                 })?;
-
-            self.connection.sync()
+        }
+        self.connection.sync()
             .map_err(|e| {
                 error!("{e}");
                 InputError::Simulate("error when syncing with X server using x11rb after xtest_fake_input was called")
             })?;
-        }
         Ok(())
     }
 
@@ -388,7 +552,7 @@ impl Mouse for Con {
             Coordinate::Rel => 1,
             Coordinate::Abs => 0,
         };
-        let time = x11rb::CURRENT_TIME; // CURRENT_TIME == 0
+        let time = x11rb::CURRENT_TIME;
         let root = x11rb::NONE; //  the root window of the screen the pointer is currently on
 
         let Ok(root_x) = x.try_into() else {
