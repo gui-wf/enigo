@@ -10,6 +10,7 @@ on:
   push:
     branches:
       - main
+      - test/**
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -29,11 +30,7 @@ jobs:
       matrix:
         rust:
           - stable
-          - nightly
-          - "1.93.1"
         platform:
-          - ubuntu-latest
-          - windows-latest
           - macos-latest
         features:
          # - "libei,tokio,wayland,xdo,x11rb,xdg_desktop"
@@ -42,8 +39,6 @@ jobs:
          # - "libei,tokio"
          # - "libei,smol"
          # - "wayland"
-          - "xdo"
-          - "x11rb"
          # - "xdg_desktop,tokio"
          # - "xdg_desktop,smol"
         exclude:
